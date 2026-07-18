@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext \"/home/newdisk/yxjiang/new_8T/datatest/XH-202604_\\\\\"透视\\\\\"地下油气藏——油气地球物理大模型的多模态特征融合.pdf\" /tmp/competition.txt)",
+      "Read(//tmp/**)"
+    ]
+  }
+}
