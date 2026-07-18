@@ -24,7 +24,7 @@ from typing import Tuple, Dict, Optional, List
 
 from .seismic_unet import SeismicUNet
 from .well_encoder import WellLogEncoder1D
-from .task_heads import MultiTaskHeads
+from .task_heads import GeologicalTaskHeads
 
 
 class ProjectionHead(nn.Module):
@@ -57,6 +57,64 @@ class ProjectionHead1D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class WellGuidedFusion(nn.Module):
+    """
+    Cross-modal depth-aligned fusion.
+
+    Expands well log features (per-depth) to the full seismic spatial grid
+    and fuses via 2D convolution, enabling well-derived petrophysical
+    information to guide per-pixel predictions.
+
+    Physics justification:
+      - At each depth, the well log measures rock properties that are
+        stratigraphically continuous across lateral positions.
+      - Faults show DT cycle-skipping, density drops, and borehole
+        enlargement in well logs — features invisible to seismic alone.
+      - Fractures show mud filtrate invasion in resistivity logs.
+      - These depth-specific constraints propagate laterally through
+        the 2D conv's receptive field, guided by seismic texture.
+    """
+
+    def __init__(self, feature_dim: int = 128):
+        super().__init__()
+        self.seismic_proj = nn.Conv2d(feature_dim, feature_dim, 1)
+        self.well_proj = nn.Conv1d(feature_dim, feature_dim, 1)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(feature_dim * 2, feature_dim, 3, padding=1),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feature_dim, feature_dim, 3, padding=1),
+        )
+
+    def forward(self, s_feats: torch.Tensor, w_feats: torch.Tensor
+                 ) -> torch.Tensor:
+        """
+        Args:
+            s_feats: (B, C, H, W) seismic per-pixel features
+            w_feats: (B, C, L) well per-depth features (L=H)
+        Returns:
+            fused: (B, C, H, W) well-guided seismic features
+        """
+        B, C, H, W = s_feats.shape
+        _, _, L = w_feats.shape
+
+        # Project both modalities
+        s_proj = self.seismic_proj(s_feats)          # (B, C, H, W)
+        w_proj = self.well_proj(w_feats)              # (B, C, L)
+
+        # Expand well features along lateral dimension
+        # Same well-derived depth info across all lateral positions
+        w_expand = w_proj.unsqueeze(-1).expand(-1, -1, -1, W)  # (B, C, H, W)
+
+        # Concatenate along channel dim
+        cat = torch.cat([s_proj, w_expand], dim=1)   # (B, 2C, H, W)
+
+        # Spatial fusion: 3×3 conv learns to propagate well info laterally
+        fused = self.fuse(cat)                        # (B, C, H, W)
+
+        return s_feats + fused  # residual
 
 
 class DenseSeismicWellCLIP(nn.Module):
@@ -108,10 +166,14 @@ class DenseSeismicWellCLIP(nn.Module):
             torch.ones([]) * np.log(1 / cfg.temperature)
         )
 
+        # ── Cross-modal fusion (well → seismic guidance) ──────
+        self.well_fusion = WellGuidedFusion(cfg.feature_dim)
+
         # ── Task heads ────────────────────────────────────────
-        self.task_heads = MultiTaskHeads(
+        self.task_heads = GeologicalTaskHeads(
             in_channels=cfg.feature_dim,
-            n_litho=3,
+            n_horizon_classes=14,
+            n_facies_classes=5,
         )
 
     def encode_seismic(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -272,66 +334,30 @@ class DenseSeismicWellCLIP(nn.Module):
             s_feats_proj, w_feats_proj, well_x
         )
 
-        # Task predictions on aligned seismic features
-        # (contrastive loss implicitly injects well info via gradient)
-        preds_seismic = self.task_heads(s_feats)
-        # Fused variant for comparison: use same features (will evaluate separately)
-        fused = self.fuse_features(s_feats, w_feats, well_x)
-        preds_fused = self.task_heads(fused)
+        # ── Cross-modal fusion: well features guide seismic ──
+        s_fused = self.well_fusion(s_feats, w_feats)
+
+        # ── Task predictions: ALL tasks use fused features ───
+        preds = self.task_heads(s_fused)
 
         outputs = {
             "contrastive_loss": cont_losses["contrastive_loss"],
             "acc_s2w": cont_losses["acc_s2w"],
             "acc_w2s": cont_losses["acc_w2s"],
-            "preds_seismic": preds_seismic,
-            "preds_fused": preds_fused,
+            "predictions": preds,
             "s_feats": s_feats,
             "w_feats": w_feats,
-            "fused_feats": fused,
+            "fused_feats": s_fused,
         }
 
-        # Task losses (if labels provided)
+        # Task losses (2D geological segmentation)
         if task_labels is not None:
-            total_task_loss = 0.0
-            TASK_KEYS = ["velocity", "porosity", "lithology", "density", "resistivity"]
-            REGRESSION_TASKS = {"velocity", "porosity", "density", "resistivity"}
-            CLASSIFICATION_TASKS = {"lithology"}
+            task_losses = self.task_heads.compute_losses(preds, task_labels)
+            outputs["task_loss"] = task_losses["total"]
+            for k, v in task_losses.items():
+                if k != "total":
+                    outputs[f"{k}_loss"] = v
 
-            # Per-task normalization constants (from data statistics)
-            TASK_STATS = {
-                "velocity":    (2600.0, 600.0),    # (mean, std)
-                "porosity":    (0.22, 0.07),
-                "density":     (2.35, 0.15),
-                "resistivity": (5.0, 5.0),
-            }
-
-            for task in TASK_KEYS:
-                if task in task_labels and task_labels[task] is not None:
-                    # pred: (B, C, H, W) or (B, 1, H, W)
-                    # label: (B, L) — 1D at well column
-                    pred_col = []
-                    for b in range(preds_seismic[task].shape[0]):
-                        wx = well_x[b].clamp(0, preds_seismic[task].shape[3] - 1)
-                        pred_col.append(preds_seismic[task][b, :, :, wx])
-                    pred_col = torch.stack(pred_col, dim=0)  # (B, C, L)
-
-                    gt = task_labels[task]  # (B, L)
-
-                    if task in REGRESSION_TASKS:
-                        # pred is z-scored (tanh*3), gt needs z-scoring
-                        mean, std = TASK_STATS[task]
-                        gt_norm = (gt - mean) / std
-                        l = F.mse_loss(pred_col.squeeze(1), gt_norm)
-                    elif task in CLASSIFICATION_TASKS:
-                        l = F.cross_entropy(pred_col, gt.long())
-                    else:
-                        continue
-
-                    total_task_loss = total_task_loss + l * 0.2  # weight per task
-                    outputs[f"{task}_loss"] = l
-            outputs["task_loss"] = total_task_loss
-
-            # Total loss
             outputs["total_loss"] = (
                 outputs["contrastive_loss"] + outputs["task_loss"]
             )

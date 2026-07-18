@@ -21,23 +21,28 @@ class SeismicAugmentation:
         self.hflip_prob = hflip_prob
         self.noise_std = noise_std
 
-    def __call__(self, img: np.ndarray, well_x: int) -> Tuple[np.ndarray, int]:
+    def __call__(self, img: np.ndarray, well_x: int,
+                 labels_2d: dict = None) -> Tuple[np.ndarray, int, dict]:
         if img.ndim == 2:
             img = img[np.newaxis, :, :]
 
         _, H, W = img.shape
 
-        # Horizontal flip
+        # Horizontal flip (consistent for seismic + all 2D labels)
         if np.random.random() < self.hflip_prob:
             img = img[:, :, ::-1].copy()
             well_x = W - 1 - well_x
+            if labels_2d is not None:
+                for k, v in labels_2d.items():
+                    if v.ndim >= 2:
+                        labels_2d[k] = v[:, ::-1].copy()
 
-        # Additive noise
+        # Additive noise (seismic only)
         if self.noise_std > 0:
             noise = np.random.randn(*img.shape) * self.noise_std * np.std(img)
             img = img + noise
 
-        return img.astype(np.float32), well_x
+        return img.astype(np.float32), well_x, labels_2d
 
 
 class DenseSeismicWellDataset(Dataset):
@@ -52,7 +57,7 @@ class DenseSeismicWellDataset(Dataset):
     """
 
     LOG_TYPES = ["GR", "NPHI", "RHOB", "DT", "RT", "velocity"]
-    TASK_KEYS = ["velocity", "porosity", "lithology", "density", "resistivity"]
+    TASK_KEYS = ["fault", "horizon", "facies", "fracture"]
 
     def __init__(self, hdf5_path: str, augment: bool = True,
                  normalize: bool = True, has_labels: bool = True):
@@ -71,7 +76,10 @@ class DenseSeismicWellDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         with h5py.File(self.hdf5_path, 'r') as f:
-            sec_key = f"seismic/section_{idx:04d}"
+            # Auto-detect naming format (section_XXXX or section_XXXXX)
+            all_keys = sorted(f["seismic"].keys())
+            sec_name = all_keys[idx]  # e.g., 'section_00038'
+            sec_key = f"seismic/{sec_name}"
 
             # ── Seismic ──────────────────────────────────────
             seismic = f[sec_key][:].astype(np.float32)
@@ -79,7 +87,10 @@ class DenseSeismicWellDataset(Dataset):
                          f[sec_key].attrs.get("well_index", 0)))
 
             # ── Well logs ────────────────────────────────────
-            well_id = f[sec_key].attrs.get("well_id", f"WELL_{(idx + 1):04d}")
+            well_id = f[sec_key].attrs.get("well_id", None)
+            if well_id is None:
+                well_keys = sorted(f["wells"].keys())
+                well_id = well_keys[min(idx, len(well_keys) - 1)]
             logs = []
             well_path = f"wells/{well_id}"
             if well_path in f:
@@ -95,7 +106,7 @@ class DenseSeismicWellDataset(Dataset):
             # ── Labels (1D at well column) ───────────────────
             labels = None
             if self.has_labels and self.has_label_group:
-                lbl_key = f"labels/section_{idx:04d}"
+                lbl_key = f"labels/{sec_name}"
                 if lbl_key in f:
                     labels = {}
                     for task in self.TASK_KEYS:
@@ -104,7 +115,7 @@ class DenseSeismicWellDataset(Dataset):
 
         # Augment
         if self.aug_fn is not None:
-            seismic, well_x = self.aug_fn(seismic, well_x)
+            seismic, well_x, labels = self.aug_fn(seismic, well_x, labels)
 
         # Normalize
         if self.normalize:

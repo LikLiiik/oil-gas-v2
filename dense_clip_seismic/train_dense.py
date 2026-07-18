@@ -172,7 +172,9 @@ def main():
     print(f"  Task heads:   {sum(p.numel() for p in model.task_heads.parameters()) / 1e6:.2f}M")
 
     # ── Data ──────────────────────────────────────────────────
-    has_labels = os.path.exists(args.dataset) and "labeled" in args.dataset
+    has_labels = os.path.exists(args.dataset) and \
+        ("labeled" in args.dataset or "geological" in args.dataset
+         or "realistic" in args.dataset or "consistent" in args.dataset)
     dataset = DenseSeismicWellDataset(
         hdf5_path=args.dataset if os.path.exists(args.dataset)
                   else "/data/yxjiang/datatest/openseisml_dataset.h5",

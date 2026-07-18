@@ -96,8 +96,14 @@ class SyntheticDataGenerator:
         self.wc = wc
         self.rng = np.random.RandomState(sc.seed)
 
-    def _generate_velocity_model_3d(self) -> np.ndarray:
-        """Generate 3D interval velocity model with realistic geology."""
+    def _generate_velocity_model_3d(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate 3D interval velocity model with realistic geology.
+
+        Returns:
+            v_model:  (ni, nx, nz) velocity model
+            fault_mask_3d: (ni, nx, nz) binary fault mask (from explicit fault planes)
+        """
         ni, nx, nz = self.sc.n_inline, self.sc.n_xline, self.sc.n_samples
         z = np.linspace(0, 3000, nz)
 
@@ -107,11 +113,15 @@ class SyntheticDataGenerator:
 
         # --- Layered structure ---
         n_layers = 12
+        layer_dv = np.zeros(n_layers)       # store dv per layer
+        layer_z_center = np.zeros(n_layers)  # store depth center
         for i in range(n_layers):
             z_center = (i + 1) * 3000 / n_layers
             z_idx = int(z_center / 3000 * (nz - 1))
             dv = self.rng.uniform(-250, 350)
             sigma_z = self.rng.uniform(3, 8)
+            layer_z_center[i] = z_center
+            layer_dv[i] = dv
             for iz in range(nz):
                 dist = (iz - z_idx) ** 2 / (2 * sigma_z ** 2)
                 if dist < 5:
@@ -130,10 +140,117 @@ class SyntheticDataGenerator:
                         if 0 <= ii < ni and 0 <= jj < nx:
                             v_model[ii, jj, iz] += amp * np.exp(-(di**2 + dj**2) / w**2)
 
-        # --- Small-scale heterogeneity ---
+        # ============================================================
+        # Explicit Fault Modeling (Wu et al., 2019; RGM, Gao et al., 2025)
+        # ============================================================
+        # Fault = displacement discontinuity in the velocity field.
+        # Each fault has: strike, dip, throw (with spatial decay),
+        # and a damage zone with reduced velocity.
+        n_faults = self.rng.randint(3, 6)
+        fault_mask_3d = np.zeros((ni, nx, nz), dtype=np.float32)
+
+        for _ in range(n_faults):
+            # Fault geometry
+            dip = self.rng.uniform(55, 80)              # degrees from horizontal
+            strike = self.rng.uniform(0, 180)            # degrees from xline axis
+            throw_max = self.rng.uniform(20, 80)         # max vertical throw (m)
+            throw_samples = int(throw_max / 3000 * nz)   # throw in depth samples
+
+            # Fault center position (inline, xline at mid-depth)
+            fx_c = self.rng.uniform(10, ni - 10)
+            fy_c = self.rng.uniform(10, nx - 10)
+            fz_c = self.rng.uniform(500, 2500)            # depth center (m)
+
+            # Strike vector in horizontal plane
+            strike_rad = np.radians(strike)
+            strike_dx = np.sin(strike_rad)   # inline component
+            strike_dy = np.cos(strike_rad)   # xline component
+
+            # Dip: as depth increases, fault plane position shifts
+            dip_slope = 1.0 / np.tan(np.radians(dip))  # lateral shift per depth
+
+            for iz in range(nz):
+                dz = z[iz]
+                # Fault plane position at this depth
+                # (moves laterally with depth due to dip)
+                offset = (dz - fz_c) * dip_slope
+                # Position along normal direction
+                fx = int(fx_c + offset * strike_dy * 0.012)  # scaled to grid
+                fy = int(fy_c + offset * strike_dx * 0.012)
+
+                # Throw with spatial decay (max at center, zero at tips)
+                depth_frac = abs(dz - fz_c) / max(3000 - fz_c, fz_c)
+                decay = max(0.0, 1.0 - depth_frac)  # linear decay from center
+                if decay < 0.1:
+                    continue
+                throw_z = int(throw_samples * decay)
+
+                if throw_z < 2:
+                    continue
+
+                # Damage zone: reduced velocity around fault plane
+                # Width 1-3 grid cells, 10-15% velocity reduction
+                damage_half_width = self.rng.randint(1, 4)
+                damage_reduction = self.rng.uniform(0.08, 0.18)
+
+                for di in range(-damage_half_width, damage_half_width + 1):
+                    for dj in range(-damage_half_width, damage_half_width + 1):
+                        ix_sample = fx + di
+                        iy_sample = fy + dj
+                        if 0 <= ix_sample < ni and 0 <= iy_sample < nx:
+                            dist = np.sqrt(di**2 + dj**2) / max(damage_half_width, 1)
+                            reduction = damage_reduction * (1.0 - dist)
+                            v_model[ix_sample, iy_sample, iz] *= (1.0 - reduction)
+                            # Mark as fault zone
+                            if dist < 0.5:
+                                # Mark fault trace ±1 pixel width
+                                for dt in range(-1, 2):
+                                    iz2 = iz + dt
+                                    if 0 <= iz2 < nz:
+                                        fault_mask_3d[ix_sample, iy_sample, iz2] = 1.0
+
+                # Apply throw displacement along fault normal direction
+                # Velocity on the hanging-wall side is shifted DOWN
+                for di in range(-6, 7):
+                    for dj in range(-6, 7):
+                        ix_sample = fx + di
+                        iy_sample = fy + dj
+                        if not (0 <= ix_sample < ni and 0 <= iy_sample < nx):
+                            continue
+
+                        # Determine which side of fault (signed distance from plane)
+                        # Normal vector in (ix, iy) plane at this depth
+                        normal_dist = di * strike_dy - dj * strike_dx
+                        if abs(normal_dist) < 2:
+                            continue  # skip fault plane itself
+
+                        is_hanging = normal_dist > 0  # one side drops
+
+                        if is_hanging:
+                            # Hanging wall: shift velocity DOWN by throw
+                            src_idx = iz - throw_z
+                            if 0 <= src_idx < nz:
+                                v_model[ix_sample, iy_sample, iz] = (
+                                    0.7 * v_model[ix_sample, iy_sample, iz] +
+                                    0.3 * v_model[ix_sample, iy_sample, src_idx]
+                                )
+                        else:
+                            # Footwall: shift velocity UP by throw
+                            src_idx = iz + throw_z
+                            if 0 <= src_idx < nz:
+                                v_model[ix_sample, iy_sample, iz] = (
+                                    0.7 * v_model[ix_sample, iy_sample, iz] +
+                                    0.3 * v_model[ix_sample, iy_sample, src_idx]
+                                )
+
+        # --- Small-scale heterogeneity (NOT fractures — just natural variation) ---
         v_model += self.rng.normal(0, 25, (ni, nx, nz))
         v_model = gaussian_filter(v_model, sigma=(1.0, 1.0, 0.5))
-        return v_model
+
+        # Smooth fault mask slightly (faults are thin but not single-pixel)
+        fault_mask_3d = gaussian_filter(fault_mask_3d, sigma=(0.5, 0.5, 0.5))
+
+        return v_model, fault_mask_3d
 
     def _velocity_to_reflectivity(self, v_model: np.ndarray) -> np.ndarray:
         """Gardner → Acoustic Impedance → Normal-incidence reflectivity."""
@@ -155,15 +272,15 @@ class SyntheticDataGenerator:
         seismic += 0.02 * np.std(seismic) * self.rng.normal(0, 1, seismic.shape)
         return seismic.astype(np.float32)
 
-    def generate_seismic(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (seismic_time, v_model_true)."""
+    def generate_seismic(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (seismic_time, v_model_true, fault_mask_3d)."""
         print("[Step 1a] Generating 3D velocity model ...")
-        v_model = self._generate_velocity_model_3d()
+        v_model, fault_mask_3d = self._generate_velocity_model_3d()
         print("[Step 1b] Computing reflectivity ...")
         refl = self._velocity_to_reflectivity(v_model)
         print("[Step 1c] Convolving with Ricker wavelet ...")
         seismic = self._convolve_with_wavelet(refl)
-        return seismic, v_model
+        return seismic, v_model, fault_mask_3d
 
     def generate_well_locations(self) -> np.ndarray:
         """Random well positions within survey boundary."""
@@ -172,28 +289,169 @@ class SyntheticDataGenerator:
         wy = self.rng.uniform(m, self.sc.n_xline - m, self.sc.n_wells)
         return np.column_stack([wx, wy])
 
+    def _classify_facies(self, v: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        """
+        Classify facies from velocity + depth context.
+
+        Uses deviation from the regional compaction trend as the primary
+        discriminator, then applies depth-dependent rules.
+
+        Returns:
+            facies: 0=shale, 1=silt, 2=sand, 3=carbonate
+        """
+        nz = len(v)
+        # Compaction trend: v_cmp(z) = 1500 + 0.8*z (regional baseline)
+        v_cmp = 1500.0 + 0.8 * depth
+        delta_v = v - v_cmp  # deviation from trend
+
+        # Smooth delta to remove high-freq noise
+        delta_v_s = gaussian_filter1d(delta_v.astype(np.float64), sigma=3)
+
+        facies = np.zeros(nz, dtype=np.int64)  # default: shale
+        # Sand: significant negative velocity anomaly (channels, unconsolidated)
+        facies[delta_v_s < -150] = 2
+        # Carbonate: significant positive anomaly (cemented, tight)
+        facies[(delta_v_s > 200) & (depth > 800)] = 3
+        # Silt: moderate deviations
+        facies[(delta_v_s >= -150) & (delta_v_s <= 200) & (depth > 200)] = 1
+
+        return facies
+
+    def _facies_rock_physics(self, facies: int) -> dict:
+        """
+        Rock physics parameters per facies type.
+
+        V_ma:  matrix P-wave velocity (m/s)
+        rho_ma: matrix grain density (g/cm³)
+        GR_clean: clean (no shale) gamma ray (API)
+        GR_shale: pure shale gamma ray (API)
+        a, m, n: Archie parameters
+        """
+        params = {
+            0: dict(V_ma=3300, rho_ma=2.72, GR_clean=80, GR_shale=150,
+                    a=1.0, m=2.3, n=2.0, name="shale"),
+            1: dict(V_ma=4500, rho_ma=2.68, GR_clean=30, GR_shale=130,
+                    a=1.0, m=2.1, n=2.0, name="silt"),
+            2: dict(V_ma=5500, rho_ma=2.65, GR_clean=15, GR_shale=120,
+                    a=1.0, m=2.0, n=2.0, name="sand"),
+            3: dict(V_ma=6400, rho_ma=2.71, GR_clean=10, GR_shale=100,
+                    a=1.0, m=2.2, n=2.0, name="carbonate"),
+        }
+        return params.get(facies, params[0])
+
     def generate_well_logs(self, well_locs: np.ndarray,
                            v_model: np.ndarray) -> List[Dict]:
-        """Generate petrophysical logs + velocity at each well."""
+        """
+        Generate petrophysical logs using physically-grounded formulas.
+
+        Physics-based curves:
+          DT   — inverse velocity (exact physical definition)
+          NPHI — Wyllie time-average equation: φ = (1/V-1/V_ma)/(1/V_f-1/V_ma)
+          RHOB — volumetric mixing: ρ = ρ_ma×(1-φ) + ρ_f×φ
+
+        Non-physics-based (explained below):
+          GR   — shale volume proxy. Measures natural radioactivity (K,Th,U).
+                 NO physical link to velocity. Modeled from facies + Vsh.
+          RT   — fluid saturation proxy. Governed by Archie's law:
+                 R_t = a·R_w/(φ^m·S_w^n). NO physical link to velocity.
+        """
         nz = self.sc.n_samples
         depth = np.linspace(0, 3000, nz)
+        V_f = 1500.0     # pore fluid velocity (m/s), water
+        rho_f = 1.0      # pore fluid density (g/cm³)
+        R_w = 0.1        # formation water resistivity (ohm·m)
+
         wells = []
         for w in range(self.sc.n_wells):
             ix = int(np.clip(well_locs[w, 0], 0, self.sc.n_inline - 1))
             iy = int(np.clip(well_locs[w, 1], 0, self.sc.n_xline - 1))
             v_well = v_model[ix, iy, :]
-            base = gaussian_filter1d(self.rng.normal(0, 1, nz), sigma=3)
-            v_norm = (v_well - np.mean(v_well)) / (np.std(v_well) + 1e-10)
-            gr = np.clip(45 + 25 * v_norm + 8 * base, 0, 200)
-            nphi = np.clip(0.22 - 0.08 * v_norm + 0.03 * base, 0.0, 0.45)
-            rhob = np.clip(2.35 + 0.15 * v_norm + 0.03 * base, 1.8, 2.9)
-            dt_us_ft = 1e6 / np.clip(v_well, 1500, 6000) * 0.3048
-            dt = dt_us_ft + 2 * self.rng.normal(0, 1, nz)
-            rt = np.clip(20 * np.exp(-depth / 1200) + 5 * base, 0.5, 100)
+
+            # ── Facies classification ────────────────────────
+            facies = self._classify_facies(v_well, depth)
+
+            # ── Independent random fields ────────────────────
+            # Shale volume (Vsh): lognormal around facies-typical value
+            # Represents clay content — geologically smooth, depth-correlated
+            vsh_seed = self.rng.normal(0, 1, nz)
+            vsh_noise = gaussian_filter1d(vsh_seed, sigma=8)
+
+            # Water saturation (Sw): random but facies-dependent
+            sw_seed = self.rng.normal(0, 1, nz)
+            sw_noise = gaussian_filter1d(sw_seed, sigma=4)
+
+            # Measurement noise (independent per curve)
+            noise_gr = self.rng.normal(0, 1, nz) * 3    # GR noise ~3 API
+            noise_rt = self.rng.normal(0, 1, nz) * 0.05  # log10(RT) noise
+
+            # ── Per-sample rock physics ───────────────────────
+            gr = np.zeros(nz)
+            nphi = np.zeros(nz)
+            rhob = np.zeros(nz)
+            dt = np.zeros(nz)
+            rt = np.zeros(nz)
+
+            for z in range(nz):
+                rp = self._facies_rock_physics(facies[z])
+
+                # --- Porosity: Wyllie time-average equation ---
+                # 1/V = φ/V_f + (1-φ)/V_ma → solve for φ
+                inv_V = 1.0 / max(v_well[z], 1500)
+                inv_Vf = 1.0 / V_f
+                inv_Vma = 1.0 / rp["V_ma"]
+                phi_wyllie = (inv_V - inv_Vma) / (inv_Vf - inv_Vma + 1e-10)
+                # Add facies-dependent scatter (real rocks deviate from Wyllie)
+                phi = phi_wyllie + 0.02 * self.rng.normal(0, 1)
+                phi = np.clip(phi, 0.01, 0.45)
+
+                # --- Density: volumetric mixing equation ---
+                # ρ_bulk = ρ_ma×(1-φ) + ρ_fluid×φ
+                rho = rp["rho_ma"] * (1 - phi) + rho_f * phi
+                rho += 0.015 * self.rng.normal(0, 1)  # measurement noise
+                rho = np.clip(rho, 1.8, 3.0)
+
+                # --- Sonic: exact inverse velocity ---
+                # DT(μs/ft) = 1e6 / V(m/s) × 0.3048 (m/ft)
+                dt_val = 1e6 / max(v_well[z], 1500) * 0.3048
+                dt_val += self.rng.normal(0, 1.5)  # ~1-2 μs/ft noise
+
+                # --- Gamma Ray: shale volume proxy ---
+                # GR = GR_clean + (GR_shale - GR_clean) × Vsh
+                vsh = 0.5 + 0.4 * vsh_noise[z]  # Vsh ~0.5±0.4
+                vsh = np.clip(vsh, 0.02, 0.98)
+                if facies[z] == 2:  # sand: low Vsh
+                    vsh = np.clip(0.1 + 0.2 * vsh_noise[z], 0.02, 0.40)
+                elif facies[z] == 3:  # carbonate: very low Vsh
+                    vsh = np.clip(0.05 + 0.1 * vsh_noise[z], 0.01, 0.20)
+                elif facies[z] == 0:  # shale: high Vsh
+                    vsh = np.clip(0.6 + 0.3 * vsh_noise[z], 0.40, 0.98)
+
+                gr_val = rp["GR_clean"] + (rp["GR_shale"] - rp["GR_clean"]) * vsh
+                gr_val += noise_gr[z]
+
+                # --- Resistivity: Archie's law ---
+                # R_t = a × R_w / (φ^m × Sw^n)
+                sw = 0.3 + 0.5 * (0.5 + 0.5 * sw_noise[z])  # Sw ~0.3-0.8
+                sw = np.clip(sw, 0.05, 1.0)
+                if facies[z] == 3:  # carbonate: lower Sw (often hydrocarbon-bearing)
+                    sw = np.clip(0.15 + 0.4 * (0.5 + 0.5 * sw_noise[z]), 0.03, 0.6)
+
+                phi_archie = max(phi, 0.01)
+                rt_val = rp["a"] * R_w / (phi_archie ** rp["m"] * sw ** rp["n"])
+                rt_val *= 10 ** noise_rt[z]  # log-normal multiplicative noise
+
+                # Store
+                gr[z] = np.clip(gr_val, 0, 200)
+                nphi[z] = np.clip(phi, 0.0, 0.45)
+                rhob[z] = np.clip(rho, 1.8, 3.0)
+                dt[z] = np.clip(dt_val, 40, 200)
+                rt[z] = np.clip(rt_val, 0.2, 1000)
+
             wells.append(dict(well_id=f"WELL_{w+1:04d}",
                               x_inline=well_locs[w, 0], y_xline=well_locs[w, 1],
                               depth=depth, GR=gr, NPHI=nphi, RHOB=rhob, DT=dt, RT=rt,
-                              velocity=v_well))
+                              velocity=v_well,
+                              facies=facies))
         return wells
 
     def generate_checkshots(self, wells: List[Dict]) -> List[Dict]:
@@ -522,7 +780,7 @@ def run_pipeline(output_path: str = "./openseisml_dataset.h5"):
     print("STEP 1  |  Data Collection")
     print("─" * 50)
     gen = SyntheticDataGenerator(sc, wc)
-    seismic_time, v_model_true = gen.generate_seismic()
+    seismic_time, v_model_true, fault_mask_3d = gen.generate_seismic()
     well_locs = gen.generate_well_locations()
     wells = gen.generate_well_logs(well_locs, v_model_true)
     checkshots = gen.generate_checkshots(wells)
